@@ -58,4 +58,10 @@
 // Intervalo de publicación en milisegundos (ej. 1 minutos)
 #define PUBLISH_INTERVAL 60000
 
+// --- Configuración de Actualizaciones OTA (Usando GitHub Releases) ---
+#define OTA_VERSION_URL "https://github.com/Francisco-B07/secym/releases/latest/download/version.json"
+#define OTA_FIRMWARE_URL "https://github.com/Francisco-B07/secym/releases/latest/download/firmware.bin"
+
+#define OTA_CHECK_INTERVAL 14400000 // Buscar actualizaciones cada 24 horas (24 * 60 * 60 * 1000)
+
 #endif

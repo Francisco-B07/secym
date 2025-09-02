@@ -1,12 +1,20 @@
+// Librerías estándar
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// Librerías de Sensores
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <DHT.h>
-#include <ArduinoJson.h>
-#include <time.h>
 #include "EmonLib.h"
+
+// Librerías para OTA y Persistencia
+#include <HTTPClient.h>
+#include <Update.h>
+#include <LittleFS.h>
 
 // Incluir el archivo de configuración
 #include "config.h"
@@ -62,21 +70,37 @@ char mqttTopicPub[128];
 unsigned long lastPublishTime = 0;
 unsigned long lastWifiReconnectAttempt = 0;
 unsigned long lastMqttReconnectAttempt = 0;
+unsigned long lastOtaCheckTime = 0;
 unsigned long currentReconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 
 // Declaraciones de funciones
 void setupWifi();
-void reconnectMqtt();
-void readAllSensorsAndPublish();
-void callback(char *topic, byte *payload, unsigned int length);
 void configureTime();
+void reconnectMqtt();
+void processSensors(bool publishNow);
+void callback(char *topic, byte *payload, unsigned int length);
+void saveReadingToDisk(const char *payload);
+void sendBufferedReadings();
+void checkForUpdates();
+// void readAllSensorsAndPublish();
 
+// =================================================================
+// FUNCIÓN SETUP
+// =================================================================
 void setup()
 {
     Serial.begin(115200);
     Serial.println("\n\nIniciando dispositivo...");
     Serial.print("Firmware v");
     Serial.println(FIRMWARE_VERSION);
+
+    if (!LittleFS.begin(true))
+    {
+        Serial.println("Error fatal al montar LittleFS. El dispositivo se reiniciará.");
+        delay(5000);
+        ESP.restart();
+    }
+    Serial.println("Sistema de archivos LittleFS montado.");
 
     // Inicializar sensores
     ds18b20_sensors.begin();
@@ -95,8 +119,13 @@ void setup()
     wifiClient.setCACert(root_ca);
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(callback);
+
+    checkForUpdates();
 }
 
+// =================================================================
+// FUNCIÓN LOOP PRINCIPAL
+// =================================================================
 void loop()
 {
     if (WiFi.status() != WL_CONNECTED)
@@ -115,15 +144,34 @@ void loop()
         reconnectMqtt(); // Intentará reconectar con retroceso exponencial
     }
 
-    mqttClient.loop(); // Mantener la conexión MQTT activa
-
-    if (mqttClient.connected() && (millis() - lastPublishTime > PUBLISH_INTERVAL))
+    if (mqttClient.connected())
     {
-        lastPublishTime = millis();
-        readAllSensorsAndPublish();
+        mqttClient.loop();
+        sendBufferedReadings();
+        if (millis() - lastPublishTime > PUBLISH_INTERVAL)
+        {
+            lastPublishTime = millis();
+            processSensors(true);
+        }
+        if (millis() - lastOtaCheckTime > OTA_CHECK_INTERVAL)
+        {
+            lastOtaCheckTime = millis();
+            checkForUpdates();
+        }
+    }
+    else
+    {
+        if (millis() - lastPublishTime > PUBLISH_INTERVAL)
+        {
+            lastPublishTime = millis();
+            processSensors(false);
+        }
     }
 }
 
+// =================================================================
+// FUNCIONES AUXILIARES
+// =================================================================
 void setupWifi()
 {
     Serial.print("Conectando a WiFi: ");
@@ -199,76 +247,260 @@ void reconnectMqtt()
     }
 }
 
-void readAllSensorsAndPublish()
+// void readAllSensorsAndPublish()
+// {
+//     Serial.println("Leyendo sensores para publicar...");
+
+//     // --- REFACTORIZADO: Nuevo payload alineado con el backend ---
+//     StaticJsonDocument<512> doc;
+
+//     // 1. Añadir el ID del nodo, que es la clave principal
+//     doc["node_id"] = NODE_ID;
+
+//     // 2. Añadir el timestamp en formato ISO 8601 UTC
+//     time_t now;
+//     time(&now);
+//     char timestampBuffer[32];
+//     strftime(timestampBuffer, sizeof(timestampBuffer), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+//     doc["timestamp"] = timestampBuffer;
+
+//     // 3. Leer y añadir temperatura y humedad ambiente (DHT11)
+//     float humidity = dht.readHumidity();
+//     float temperature_dht = dht.readTemperature();
+//     if (!isnan(humidity))
+//     {
+//         doc["ambiente_hum"] = humidity;
+//     }
+//     if (!isnan(temperature_dht))
+//     {
+//         doc["ambiente_temp"] = temperature_dht;
+//     }
+
+//     // 4. Leer y añadir corrientes (SCT-013)
+//     // --- REFACTORIZADO: Reducir el número de muestras para evitar bloqueo ---
+//     // 250ms de muestreo es un buen compromiso. 1480 muestras ~ 250ms a 60Hz.
+//     double Irms1 = emon1.calcIrms(250);
+//     double Irms2 = emon2.calcIrms(250);
+//     doc["corriente_a"] = Irms1;
+//     doc["corriente_b"] = Irms2;
+
+//     // 5. Leer y añadir temperaturas de las sondas (DS18B20)
+//     ds18b20_sensors.requestTemperatures();
+//     JsonArray sondas_temp = doc.createNestedArray("sondas_temp");
+//     for (int i = 0; i < DS18B20_COUNT; i++)
+//     {
+//         float tempC = ds18b20_sensors.getTempCByIndex(i);
+//         // --- REFACTORIZADO: Añadir al array solo si la lectura es válida ---
+//         if (tempC != DEVICE_DISCONNECTED_C)
+//         {
+//             sondas_temp.add(tempC);
+//         }
+//         else
+//         {
+//             sondas_temp.add(nullptr); // Añadir 'null' para mantener el orden si una sonda falla
+//             Serial.printf("Error: No se pudo leer del sensor DS18B20 #%d\n", i);
+//         }
+//     }
+
+//     // Serializar y publicar
+//     char buffer[512];
+//     size_t n = serializeJson(doc, buffer);
+
+//     Serial.print("Publicando payload: ");
+//     Serial.println(buffer);
+
+//     if (mqttClient.publish(mqttTopicPub, buffer, n))
+//     {
+//         Serial.println("Mensaje publicado con éxito.");
+//     }
+//     else
+//     {
+//         Serial.println("Error al publicar el mensaje.");
+//     }
+// }
+
+void processSensors(bool publishNow)
 {
-    Serial.println("Leyendo sensores para publicar...");
+    if (publishNow)
+    {
+        Serial.println("Leyendo sensores para publicar...");
+    }
+    else
+    {
+        Serial.println("Sin conexión. Leyendo sensores para guardar en disco...");
+    }
 
-    // --- REFACTORIZADO: Nuevo payload alineado con el backend ---
     StaticJsonDocument<512> doc;
-
-    // 1. Añadir el ID del nodo, que es la clave principal
     doc["node_id"] = NODE_ID;
 
-    // 2. Añadir el timestamp en formato ISO 8601 UTC
     time_t now;
     time(&now);
     char timestampBuffer[32];
     strftime(timestampBuffer, sizeof(timestampBuffer), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
     doc["timestamp"] = timestampBuffer;
 
-    // 3. Leer y añadir temperatura y humedad ambiente (DHT11)
     float humidity = dht.readHumidity();
     float temperature_dht = dht.readTemperature();
     if (!isnan(humidity))
-    {
         doc["ambiente_hum"] = humidity;
-    }
     if (!isnan(temperature_dht))
-    {
         doc["ambiente_temp"] = temperature_dht;
-    }
 
-    // 4. Leer y añadir corrientes (SCT-013)
-    // --- REFACTORIZADO: Reducir el número de muestras para evitar bloqueo ---
-    // 250ms de muestreo es un buen compromiso. 1480 muestras ~ 250ms a 60Hz.
     double Irms1 = emon1.calcIrms(250);
     double Irms2 = emon2.calcIrms(250);
     doc["corriente_a"] = Irms1;
     doc["corriente_b"] = Irms2;
 
-    // 5. Leer y añadir temperaturas de las sondas (DS18B20)
     ds18b20_sensors.requestTemperatures();
     JsonArray sondas_temp = doc.createNestedArray("sondas_temp");
     for (int i = 0; i < DS18B20_COUNT; i++)
     {
         float tempC = ds18b20_sensors.getTempCByIndex(i);
-        // --- REFACTORIZADO: Añadir al array solo si la lectura es válida ---
         if (tempC != DEVICE_DISCONNECTED_C)
         {
             sondas_temp.add(tempC);
         }
         else
         {
-            sondas_temp.add(nullptr); // Añadir 'null' para mantener el orden si una sonda falla
+            sondas_temp.add(nullptr);
             Serial.printf("Error: No se pudo leer del sensor DS18B20 #%d\n", i);
         }
     }
 
-    // Serializar y publicar
     char buffer[512];
     size_t n = serializeJson(doc, buffer);
 
-    Serial.print("Publicando payload: ");
-    Serial.println(buffer);
-
-    if (mqttClient.publish(mqttTopicPub, buffer, n))
+    if (publishNow)
     {
-        Serial.println("Mensaje publicado con éxito.");
+        if (!mqttClient.publish(mqttTopicPub, buffer, n))
+        {
+            Serial.println("Error al publicar. El mensaje se guardará.");
+            saveReadingToDisk(buffer);
+        }
+        else
+        {
+            Serial.println("Mensaje publicado con éxito.");
+        }
     }
     else
     {
-        Serial.println("Error al publicar el mensaje.");
+        saveReadingToDisk(buffer);
     }
+}
+
+void saveReadingToDisk(const char *payload)
+{
+    char filename[32];
+    sprintf(filename, "/data/%ld.json", time(nullptr));
+    if (!LittleFS.exists("/data"))
+    {
+        LittleFS.mkdir("/data");
+    }
+    File file = LittleFS.open(filename, "w");
+    if (!file)
+    {
+        Serial.println("Error al abrir el archivo para escritura");
+        return;
+    }
+    if (file.print(payload))
+    {
+        Serial.printf("Lectura guardada en disco: %s\n", filename);
+    }
+    else
+    {
+        Serial.println("Error al escribir en el archivo");
+    }
+    file.close();
+}
+
+void sendBufferedReadings()
+{
+    File root = LittleFS.open("/data");
+    if (!root || !root.isDirectory())
+    {
+        return;
+    }
+    File file = root.openNextFile();
+    while (file)
+    {
+        Serial.printf("Encontrado mensaje en búfer: %s\n", file.name());
+        String payload = file.readString();
+        String fullPath = file.name();
+        file.close();
+
+        if (mqttClient.publish(mqttTopicPub, payload.c_str(), payload.length()))
+        {
+            Serial.printf("Mensaje en búfer %s enviado. Eliminando archivo.\n", fullPath.c_str());
+            LittleFS.remove(fullPath.c_str());
+        }
+        else
+        {
+            Serial.println("Fallo al enviar mensaje en búfer. Se reintentará.");
+            break;
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+}
+
+void checkForUpdates()
+{
+    Serial.println("Buscando actualizaciones de firmware...");
+    HTTPClient http;
+    http.begin(OTA_VERSION_URL);
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK)
+    {
+        Serial.printf("Error al buscar versión, código: %d\n", httpCode);
+        http.end();
+        return;
+    }
+    StaticJsonDocument<128> doc;
+    deserializeJson(doc, http.getString());
+    const char *serverVersion = doc["version"];
+    http.end();
+
+    Serial.printf("Versión actual: %s, Versión del servidor: %s\n", FIRMWARE_VERSION, serverVersion);
+    if (strcmp(serverVersion, FIRMWARE_VERSION) > 0)
+    {
+        Serial.println("¡Nueva versión disponible! Iniciando actualización...");
+        http.begin(OTA_FIRMWARE_URL);
+        int httpCodeFw = http.GET();
+        if (httpCodeFw != HTTP_CODE_OK)
+        {
+            Serial.printf("Error al descargar firmware, código: %d\n", httpCodeFw);
+            http.end();
+            return;
+        }
+        int contentLength = http.getSize();
+        if (!Update.begin(contentLength))
+        {
+            Update.printError(Serial);
+            http.end();
+            return;
+        }
+        size_t written = Update.writeStream(*http.getStreamPtr());
+        if (written != contentLength)
+        {
+            Serial.printf("Error de escritura: %d de %d bytes.\n", written, contentLength);
+            http.end();
+            return;
+        }
+        if (Update.end(true))
+        {
+            Serial.println("¡Actualización OTA completada! Reiniciando...");
+            ESP.restart();
+        }
+        else
+        {
+            Update.printError(Serial);
+        }
+    }
+    else
+    {
+        Serial.println("El firmware ya está actualizado.");
+    }
+    http.end();
 }
 
 void callback(char *topic, byte *payload, unsigned int length)
