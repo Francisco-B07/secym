@@ -1,48 +1,61 @@
-// -- WiFi Configuration
-#define WIFI_SSID "SSID_Hospital_IoT"
-#define WIFI_PASSWORD "Password_Seguro_WiFi"
+#ifndef CONFIG_H
+#define CONFIG_H
 
-// -- MQTT Broker Configuration
-#define MQTT_BROKER "xxxx.supabase.co"
+// --- INFORMACIÓN DEL FIRMWARE ---
+#define FIRMWARE_VERSION "1.0.0"
+
+// --- Configuración WiFi ---
+#ifndef WIFI_SSID
+#define WIFI_SSID "TU_SSID_AQUI"
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "TU_PASSWORD_AQUI"
+#endif
+
+// --- Configuración MQTT (HiveMQ Cloud) ---
+#define MQTT_BROKER "d7cc57e848fc4effa97498abc32223fc.s1.eu.hivemq.cloud"
 #define MQTT_PORT 8883
-#define MQTT_USER "service_role"
-#define MQTT_PASSWORD "SUPABASE_SERVICE_ROLE_KEY"
-#define MQTT_TOPIC_DATA "realtime/topic/esp32/sensor_data"
+#ifndef MQTT_USER
+#define MQTT_USER "usuario_ejemplo"
+#endif
+#ifndef MQTT_PASSWORD
+#define MQTT_PASSWORD "password_ejemplo"
+#endif
 
-// -- Node Configuration
-#define NODE_ID "ESP32_NODO_LABORATORIO_01"
+// Identificadores para el Topic Dinámico ---
+// CLIENT_ID: El identificador de tu cliente final (ej. el hospital, la farmacia).
+#define CLIENT_ID "htalRawson"
+// NODE_ID: El identificador único de este dispositivo ESP32. Debe coincidir
+// con el 'node_id' en tu tabla 'devices' de Supabase.
+#define NODE_ID "ESP32_SECYM_01"
 
-// -- Timing Configuration (en milisegundos)
-#define PUBLISH_INTERVAL 300000       // 5 minutos
-#define WIFI_RECONNECT_INTERVAL 20000 // Intentar reconectar WiFi cada 20 segundos
-#define MQTT_RECONNECT_INTERVAL 10000 // Intentar reconectar MQTT cada 10 segundos
+// Parámetros para Reconexión con Retroceso Exponencial ---
+#define INITIAL_RECONNECT_DELAY_MS 5000 // Empezar con 5 segundos
+#define MAX_RECONNECT_DELAY_MS 120000   // Máximo de 2 minutos de espera
+#define RECONNECT_MULTIPLIER 2          // Duplicar el tiempo de espera en cada fallo
 
-// -- Hardware Pin Configuration
-#define ONEWIRE_BUS_PIN 4 // Pin para el bus de sensores DS18B20
+// --- Configuración de Sensores ---
+// Pines GPIO
+#define ONE_WIRE_BUS_PIN 4
+#define DHT_PIN 5
+#define SCT013_1_PIN 34
+#define SCT013_2_PIN 35
 
-// <-- CAMBIO: Se eliminan los pines del multiplexor.
-// <-- CAMBIO: Se define un array para los pines ADC de cada sensor de corriente.
-// ¡IMPORTANTE! En ESP32, usa pines del ADC1 (ej. 32-39) cuando uses WiFi.
-const int current_sensor_adc_pins[] = {36, 39}; // Usando GPIO36 (ADC1_CH0) y GPIO39 (ADC1_CH3)
+// Tipo de sensor DHT
+#define DHT_TYPE DHT11
 
-// -- Asset Mapping (¡CRUCIAL!)
-// Mapea la dirección física del sensor a un ID de activo lógico.
-const char *asset_ids[] = {"HELADERA_VACUNAS_01", "FREEZER_MUESTRAS_02"};
-const uint8_t ds18b20_addresses[][8] = {
-    {0x28, 0xFF, 0x64, 0x1E, 0x54, 0x3F, 0x2A, 0x9B}, // Dirección del sensor de la Heladera 01
-    {0x28, 0xAA, 0x7E, 0x2B, 0x6, 0x0, 0x0, 0x81}     // Dirección del sensor del Freezer 02
-};
+// Número de sensores DS18B20
+#define DS18B20_COUNT 5
 
-// Mapea el pin del sensor de puerta al mismo ID de activo
-const int door_sensor_pins[] = {25, 26}; // Pines GPIO
-const int NUM_ASSETS = sizeof(asset_ids) / sizeof(asset_ids[0]);
+// Calibración para EmonLib (ajustar según tu resistencia de carga)
+// Este valor se calcula a partir de la resistencia de carga (100Ω) y la relación de espiras del CT (2000:1)
+// Calibración = (2000 / 100) = 20.0
 
-// -- NTP Server for UTC Timestamp
-#define NTP_SERVER "pool.ntp.org"
-#define GMT_OFFSET_SEC -10800 // Para Argentina (GMT-3)
-#define DAYLIGHT_OFFSET_SEC 0
+#define EMON_CALIBRATION_1 20.0
+#define EMON_CALIBRATION_2 20.0
 
-// -- Root CA Certificate for Supabase/MQTT Broker (TLS)
-const char *root_ca =
-    "-----BEGIN CERTIFICATE-----\n" // ... (Pega aquí el certificado CA de tu broker) ...
-    "-----END CERTIFICATE-----\n";
+// --- Configuración del Sistema ---
+// Intervalo de publicación en milisegundos (ej. 1 minutos)
+#define PUBLISH_INTERVAL 60000
+
+#endif
