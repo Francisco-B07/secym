@@ -5,6 +5,8 @@
 #include <ArduinoJson.h>
 #include <time.h>
 
+#include <esp_task_wdt.h>
+
 // Librerías de Sensores
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -18,6 +20,9 @@
 
 // Incluir el archivo de configuración
 #include "config.h"
+
+// --- Timeout para el Watchdog en segundos ---
+#define WDT_TIMEOUT_S 30
 
 // Pega aquí el contenido de tu archivo .cer
 static const char *root_ca PROGMEM = R"EOF(
@@ -82,6 +87,7 @@ void callback(char *topic, byte *payload, unsigned int length);
 void saveReadingToDisk(const char *payload);
 void sendBufferedReadings();
 void checkForUpdates();
+void setupWatchdog();
 // void readAllSensorsAndPublish();
 
 // =================================================================
@@ -94,13 +100,28 @@ void setup()
     Serial.print("Firmware v");
     Serial.println(FIRMWARE_VERSION);
 
-    if (!LittleFS.begin(true))
+    // Configurar e iniciar el Watchdog Timer ---
+    setupWatchdog();
+
+    if (!LittleFS.begin(true, "/littlefs"))
     {
         Serial.println("Error fatal al montar LittleFS. El dispositivo se reiniciará.");
         delay(5000);
         ESP.restart();
     }
     Serial.println("Sistema de archivos LittleFS montado.");
+
+    if (!LittleFS.exists("/data"))
+    {
+        if (LittleFS.mkdir("/data"))
+        {
+            Serial.println("Directorio /data creado.");
+        }
+        else
+        {
+            Serial.println("Error fatal al crear el directorio /data.");
+        }
+    }
 
     // Inicializar sensores
     ds18b20_sensors.begin();
@@ -119,8 +140,6 @@ void setup()
     wifiClient.setCACert(root_ca);
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(callback);
-
-    checkForUpdates();
 }
 
 // =================================================================
@@ -128,6 +147,9 @@ void setup()
 // =================================================================
 void loop()
 {
+    // --- Alimentar al perro guardián en cada iteración ---
+    esp_task_wdt_reset();
+
     if (WiFi.status() != WL_CONNECTED)
     {
         if (millis() - lastWifiReconnectAttempt > 15000)
@@ -144,27 +166,29 @@ void loop()
         reconnectMqtt(); // Intentará reconectar con retroceso exponencial
     }
 
+    // El cliente MQTT debe procesar mensajes incluso si no estamos publicando
     if (mqttClient.connected())
     {
         mqttClient.loop();
+    }
+
+    // --- Lógica de publicación y guardado desacoplada de la conexión ---
+    if (millis() - lastPublishTime > PUBLISH_INTERVAL)
+    {
+        lastPublishTime = millis();
+        // Intentar publicar si estamos conectados, si no, la función guardará en disco.
+        processSensors(mqttClient.connected());
+    }
+
+    // --- Lógica de envío de datos bufferizados y OTA solo si hay conexión ---
+    if (mqttClient.connected())
+    {
         sendBufferedReadings();
-        if (millis() - lastPublishTime > PUBLISH_INTERVAL)
-        {
-            lastPublishTime = millis();
-            processSensors(true);
-        }
+
         if (millis() - lastOtaCheckTime > OTA_CHECK_INTERVAL)
         {
             lastOtaCheckTime = millis();
             checkForUpdates();
-        }
-    }
-    else
-    {
-        if (millis() - lastPublishTime > PUBLISH_INTERVAL)
-        {
-            lastPublishTime = millis();
-            processSensors(false);
         }
     }
 }
@@ -172,6 +196,15 @@ void loop()
 // =================================================================
 // FUNCIONES AUXILIARES
 // =================================================================
+
+// --- Función para configurar el Watchdog Timer ---
+void setupWatchdog()
+{
+    Serial.printf("Configurando Watchdog Timer con timeout de %d segundos.\n", WDT_TIMEOUT_S);
+    esp_task_wdt_init(WDT_TIMEOUT_S, true); // Habilitar panic WDT
+    esp_task_wdt_add(NULL);                 // Añadir el task actual (loop) al WDT
+}
+
 void setupWifi()
 {
     Serial.print("Conectando a WiFi: ");
@@ -185,6 +218,7 @@ void setupWifi()
         delay(500);
         Serial.print(".");
         retries++;
+        esp_task_wdt_reset(); // Alimentar WDT durante esperas largas
     }
 
     if (WiFi.status() == WL_CONNECTED)
@@ -204,7 +238,8 @@ void setupWifi()
 void configureTime()
 {
     Serial.println("Sincronizando hora del sistema vía NTP...");
-    configTime(-3 * 3600, 0, "pool.ntp.org"); // GMT-3
+    // ---  Añadir servidores NTP de respaldo ---
+    configTime(-3 * 3600, 0, "pool.ntp.org", "time.google.com"); // GMT-3
 
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo, 10000))
@@ -356,7 +391,7 @@ void processSensors(bool publishNow)
     for (int i = 0; i < DS18B20_COUNT; i++)
     {
         float tempC = ds18b20_sensors.getTempCByIndex(i);
-        if (tempC != DEVICE_DISCONNECTED_C)
+        if (tempC > -127.0)
         {
             sondas_temp.add(tempC);
         }
@@ -392,10 +427,7 @@ void saveReadingToDisk(const char *payload)
 {
     char filename[32];
     sprintf(filename, "/data/%ld.json", time(nullptr));
-    if (!LittleFS.exists("/data"))
-    {
-        LittleFS.mkdir("/data");
-    }
+
     File file = LittleFS.open(filename, "w");
     if (!file)
     {
@@ -420,8 +452,10 @@ void sendBufferedReadings()
     {
         return;
     }
+
     File file = root.openNextFile();
-    while (file)
+    // Enviar solo un archivo por ciclo para no bloquear el loop por mucho tiempo
+    if (file)
     {
         Serial.printf("Encontrado mensaje en búfer: %s\n", file.name());
         String payload = file.readString();
@@ -431,14 +465,15 @@ void sendBufferedReadings()
         if (mqttClient.publish(mqttTopicPub, payload.c_str(), payload.length()))
         {
             Serial.printf("Mensaje en búfer %s enviado. Eliminando archivo.\n", fullPath.c_str());
-            LittleFS.remove(fullPath.c_str());
+            if (!LittleFS.remove(fullPath.c_str()))
+            {
+                Serial.printf("Error al eliminar el archivo: %s\n", fullPath.c_str());
+            }
         }
         else
         {
             Serial.println("Fallo al enviar mensaje en búfer. Se reintentará.");
-            break;
         }
-        file = root.openNextFile();
     }
     root.close();
 }
@@ -447,20 +482,30 @@ void checkForUpdates()
 {
     Serial.println("Buscando actualizaciones de firmware...");
     HTTPClient http;
+
     http.begin(OTA_VERSION_URL);
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK)
     {
         Serial.printf("Error al buscar versión, código: %d\n", httpCode);
-        http.end();
+        http.end(); // Asegurar limpieza
         return;
     }
-    StaticJsonDocument<128> doc;
-    deserializeJson(doc, http.getString());
-    const char *serverVersion = doc["version"];
-    http.end();
 
+    StaticJsonDocument<128> doc;
+    DeserializationError error = deserializeJson(doc, http.getString());
+    http.end(); // Limpiar después de usar el stream/string
+
+    if (error)
+    {
+        Serial.print(F("deserializeJson() falló: "));
+        Serial.println(error.c_str());
+        return;
+    }
+
+    const char *serverVersion = doc["version"];
     Serial.printf("Versión actual: %s, Versión del servidor: %s\n", FIRMWARE_VERSION, serverVersion);
+
     if (strcmp(serverVersion, FIRMWARE_VERSION) > 0)
     {
         Serial.println("¡Nueva versión disponible! Iniciando actualización...");
@@ -472,27 +517,40 @@ void checkForUpdates()
             http.end();
             return;
         }
+
         int contentLength = http.getSize();
+        if (contentLength <= 0)
+        {
+            Serial.println("Error: Content-Length es inválido.");
+            http.end();
+            return;
+        }
+
         if (!Update.begin(contentLength))
         {
             Update.printError(Serial);
             http.end();
             return;
         }
+
+        // Realizar la actualización
         size_t written = Update.writeStream(*http.getStreamPtr());
+
         if (written != contentLength)
         {
             Serial.printf("Error de escritura: %d de %d bytes.\n", written, contentLength);
-            http.end();
-            return;
         }
-        if (Update.end(true))
+
+        http.end(); // Limpiar la conexión HTTP tan pronto como sea posible
+
+        if (Update.end(true)) // true para aplicar la actualización
         {
             Serial.println("¡Actualización OTA completada! Reiniciando...");
             ESP.restart();
         }
         else
         {
+            Serial.println("Error en Update.end(). La actualización falló.");
             Update.printError(Serial);
         }
     }
@@ -500,7 +558,6 @@ void checkForUpdates()
     {
         Serial.println("El firmware ya está actualizado.");
     }
-    http.end();
 }
 
 void callback(char *topic, byte *payload, unsigned int length)

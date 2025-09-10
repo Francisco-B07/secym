@@ -2,7 +2,7 @@
 #define CONFIG_H
 
 // --- INFORMACIÓN DEL FIRMWARE ---
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.0.1"
 
 // --- Configuración WiFi ---
 #ifndef WIFI_SSID
@@ -55,13 +55,13 @@
 #define EMON_CALIBRATION_2 20.0
 
 // --- Configuración del Sistema ---
-// Intervalo de publicación en milisegundos (ej. 1 minutos)
-#define PUBLISH_INTERVAL 60000
+// Intervalo de publicación en milisegundos (ej. 10 minutos)
+#define PUBLISH_INTERVAL 600000
 
 // --- Configuración de Actualizaciones OTA (Usando GitHub Releases) ---
 #define OTA_VERSION_URL "https://github.com/Francisco-B07/secym/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/Francisco-B07/secym/releases/latest/download/firmware.bin"
 
-#define OTA_CHECK_INTERVAL 14400000 // Buscar actualizaciones cada 24 horas (24 * 60 * 60 * 1000)
+#define OTA_CHECK_INTERVAL 86400000 // Buscar actualizaciones cada 24 horas (24 * 60 * 60 * 1000)
 
 #endif
