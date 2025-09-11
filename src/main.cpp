@@ -68,6 +68,8 @@ DHT dht(DHT_PIN, DHT_TYPE);
 EnergyMonitor emon1;
 EnergyMonitor emon2;
 
+int detected_ds18b20_count = 0;
+
 // --- REFACTORIZADO: Topic dinámico ---
 char mqttTopicPub[128];
 
@@ -128,6 +130,9 @@ void setup()
     dht.begin();
     emon1.current(SCT013_1_PIN, EMON_CALIBRATION_1);
     emon2.current(SCT013_2_PIN, EMON_CALIBRATION_2);
+
+    detected_ds18b20_count = ds18b20_sensors.getDeviceCount();
+    Serial.printf("Se han detectado %d sensores DS18B20.\n", detected_ds18b20_count);
 
     setupWifi();
     configureTime();
@@ -373,6 +378,7 @@ void processSensors(bool publishNow)
     char timestampBuffer[32];
     strftime(timestampBuffer, sizeof(timestampBuffer), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
     doc["timestamp"] = timestampBuffer;
+    doc["firmware_version"] = FIRMWARE_VERSION;
 
     float humidity = dht.readHumidity();
     float temperature_dht = dht.readTemperature();
@@ -388,7 +394,7 @@ void processSensors(bool publishNow)
 
     ds18b20_sensors.requestTemperatures();
     JsonArray sondas_temp = doc.createNestedArray("sondas_temp");
-    for (int i = 0; i < DS18B20_COUNT; i++)
+    for (int i = 0; i < detected_ds18b20_count; i++)
     {
         float tempC = ds18b20_sensors.getTempCByIndex(i);
         if (tempC > -127.0)
@@ -450,6 +456,8 @@ void sendBufferedReadings()
     File root = LittleFS.open("/data");
     if (!root || !root.isDirectory())
     {
+        if (root)
+            root.close();
         return;
     }
 
@@ -459,12 +467,14 @@ void sendBufferedReadings()
     {
         Serial.printf("Encontrado mensaje en búfer: %s\n", file.name());
         String payload = file.readString();
-        String fullPath = file.name();
+        String fullPath = "/data/" + String(file.name());
         file.close();
 
         if (mqttClient.publish(mqttTopicPub, payload.c_str(), payload.length()))
         {
             Serial.printf("Mensaje en búfer %s enviado. Eliminando archivo.\n", fullPath.c_str());
+
+            // Ahora usamos la ruta completa para eliminar el archivo
             if (!LittleFS.remove(fullPath.c_str()))
             {
                 Serial.printf("Error al eliminar el archivo: %s\n", fullPath.c_str());

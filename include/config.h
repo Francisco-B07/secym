@@ -2,7 +2,7 @@
 #define CONFIG_H
 
 // --- INFORMACIÓN DEL FIRMWARE ---
-#define FIRMWARE_VERSION "1.0.1"
+#define FIRMWARE_VERSION "1.1.1"
 
 // --- Configuración WiFi ---
 #ifndef WIFI_SSID
@@ -45,7 +45,7 @@
 #define DHT_TYPE DHT11
 
 // Número de sensores DS18B20
-#define DS18B20_COUNT 5
+// #define DS18B20_COUNT 5
 
 // Calibración para EmonLib (ajustar según tu resistencia de carga)
 // Este valor se calcula a partir de la resistencia de carga (100Ω) y la relación de espiras del CT (2000:1)
