@@ -2,7 +2,11 @@
 #define CONFIG_H
 
 // --- INFORMACIÓN DEL FIRMWARE ---
-#define FIRMWARE_VERSION "1.1.1"
+#define FIRMWARE_VERSION "1.1.5"
+
+// --- Límites de Almacenamiento ---
+#define MAX_BUFFERED_FILES 100  // Máximo de lecturas guardadas (aprox 100 minutos si publicas cada 1min)
+#define MAX_FS_USAGE_PERCENT 85 // No escribir si el disco está al 85%
 
 // --- Configuración WiFi ---
 #ifndef WIFI_SSID
@@ -24,10 +28,11 @@
 
 // Identificadores para el Topic Dinámico ---
 // CLIENT_ID: El identificador de tu cliente final (ej. el hospital, la farmacia).
-#define CLIENT_ID "htalRawson"
+// #define CLIENT_ID "htalRawson"
+#define CLIENT_ID "Farmacia"
 // NODE_ID: El identificador único de este dispositivo ESP32. Debe coincidir
 // con el 'node_id' en tu tabla 'devices' de Supabase.
-#define NODE_ID "ESP32_SECYM_01"
+#define NODE_ID "SECYM_01"
 
 // Parámetros para Reconexión con Retroceso Exponencial ---
 #define INITIAL_RECONNECT_DELAY_MS 5000 // Empezar con 5 segundos
@@ -56,7 +61,8 @@
 
 // --- Configuración del Sistema ---
 // Intervalo de publicación en milisegundos (ej. 10 minutos)
-#define PUBLISH_INTERVAL 600000
+#define PUBLISH_INTERVAL 600000 //(10 minuto)
+// #define PUBLISH_INTERVAL 600000
 
 // --- Configuración de Actualizaciones OTA (Usando GitHub Releases) ---
 #define OTA_VERSION_URL "https://github.com/Francisco-B07/secym/releases/latest/download/version.json"

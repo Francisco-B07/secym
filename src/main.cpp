@@ -78,6 +78,7 @@ unsigned long lastPublishTime = 0;
 unsigned long lastWifiReconnectAttempt = 0;
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastOtaCheckTime = 0;
+bool otaCheckedOnce = false;
 unsigned long currentReconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 
 // Declaraciones de funciones
@@ -91,6 +92,14 @@ void sendBufferedReadings();
 void checkForUpdates();
 void setupWatchdog();
 // void readAllSensorsAndPublish();
+
+// --- Variables para control de temperatura asíncrona ---
+bool conversionInProgress = false;
+unsigned long conversionStartTime = 0;
+const unsigned long CONVERSION_TIME_MS = 800;
+
+// Variable global para evitar buscar archivos si sabemos que no hay
+bool filesToSync = true;
 
 // =================================================================
 // FUNCIÓN SETUP
@@ -127,6 +136,7 @@ void setup()
 
     // Inicializar sensores
     ds18b20_sensors.begin();
+    ds18b20_sensors.setWaitForConversion(false);
     dht.begin();
     emon1.current(SCT013_1_PIN, EMON_CALIBRATION_1);
     emon2.current(SCT013_2_PIN, EMON_CALIBRATION_2);
@@ -152,52 +162,109 @@ void setup()
 // =================================================================
 void loop()
 {
-    // --- Alimentar al perro guardián en cada iteración ---
+    // 1. Alimentar al perro guardián (Watchdog) en cada iteración
     esp_task_wdt_reset();
 
+    unsigned long now = millis();
+
+    // 2. Gestión de Conectividad WiFi
     if (WiFi.status() != WL_CONNECTED)
     {
-        if (millis() - lastWifiReconnectAttempt > 15000)
-        { // Reintentar WiFi cada 15s
-            lastWifiReconnectAttempt = millis();
-            Serial.println("WiFi desconectado. Reintentando conexión...");
-            WiFi.reconnect();
+        if (now - lastWifiReconnectAttempt > 15000)
+        {
+            lastWifiReconnectAttempt = now;
+            Serial.println("Conexión WiFi perdida. Ejecutando limpieza y renegociando IP...");
+
+            // Forzar desconexión profunda para evitar que el router nos bloquee
+            WiFi.disconnect(true);
+            delay(1000);
+
+            // Volver a iniciar el ciclo de autenticación
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         }
-        return; // No hacer nada más si no hay WiFi
+        // No salimos con return para permitir que otras tareas locales (como leer sondas) sigan funcionando
     }
 
-    if (!mqttClient.connected())
+    // 3. Gestión de Conectividad MQTT
+    if (WiFi.status() == WL_CONNECTED && !mqttClient.connected())
     {
-        reconnectMqtt(); // Intentará reconectar con retroceso exponencial
+        reconnectMqtt();
     }
 
-    // El cliente MQTT debe procesar mensajes incluso si no estamos publicando
+    // 4. Procesar mensajes entrantes (Callback)
     if (mqttClient.connected())
     {
         mqttClient.loop();
     }
 
-    // --- Lógica de publicación y guardado desacoplada de la conexión ---
-    if (millis() - lastPublishTime > PUBLISH_INTERVAL)
+    // 5. LÓGICA DE SENSORES ASÍNCRONA (MÁQUINA DE ESTADOS)
+
+    // FASE A: Iniciar conversión de sensores DS18B20 (1 segundo antes de publicar)
+    if (!conversionInProgress && (now - lastPublishTime > (PUBLISH_INTERVAL - 1000)))
     {
-        lastPublishTime = millis();
-        // Intentar publicar si estamos conectados, si no, la función guardará en disco.
-        processSensors(mqttClient.connected());
+        // === RUTINA DE AUTO-REPARACIÓN (PLUG & PLAY) ===
+        // Si el conteo es 0 (fallo en el arranque), intentamos reiniciar el bus
+        if (detected_ds18b20_count == 0)
+        {
+            Serial.println("Re-escaneando bus 1-Wire...");
+            ds18b20_sensors.begin();
+            // CRÍTICO: Al hacer begin() se pierden las configuraciones, debemos volver a setear el asincronismo
+            ds18b20_sensors.setWaitForConversion(false);
+            detected_ds18b20_count = ds18b20_sensors.getDeviceCount();
+            if (detected_ds18b20_count > 0)
+            {
+                Serial.printf("¡Éxito! Se recuperaron %d sensores DS18B20.\n", detected_ds18b20_count);
+            }
+        }
+
+        // Si hay sondas (ya sea desde el arranque o recuperadas), pedimos temperaturas
+        if (detected_ds18b20_count > 0)
+        {
+            ds18b20_sensors.requestTemperatures();
+        }
+
+        conversionStartTime = now;
+        conversionInProgress = true;
     }
 
-    // --- Lógica de envío de datos bufferizados y OTA solo si hay conexión ---
+    // FASE B: Procesar y Publicar cuando se cumple el intervalo
+    if (now - lastPublishTime > PUBLISH_INTERVAL)
+    {
+        // Solo procedemos si la conversión ha tenido tiempo suficiente
+        if (conversionInProgress && (now - conversionStartTime >= CONVERSION_TIME_MS))
+        {
+            lastPublishTime = now;
+
+            // Intentar publicar si hay MQTT, de lo contrario guarda en disco (lógica interna de processSensors)
+            processSensors(mqttClient.connected());
+
+            // Liberar la bandera para la próxima lectura
+            conversionInProgress = false;
+        }
+        else if (!conversionInProgress)
+        {
+            // Caso de seguridad: si llegamos al tiempo de publicación y no se inició conversión (ej. primer arranque)
+            ds18b20_sensors.requestTemperatures();
+            conversionStartTime = now;
+            conversionInProgress = true;
+        }
+    }
+
+    // 6. Tareas secundarias (Solo si hay conexión para no saturar el bus interno)
     if (mqttClient.connected())
     {
+        // Enviar archivos pendientes de LittleFS uno por uno
         sendBufferedReadings();
 
-        if (millis() - lastOtaCheckTime > OTA_CHECK_INTERVAL)
+        // Verificar actualizaciones OTA cada 24hs
+        if (!otaCheckedOnce || (now - lastOtaCheckTime > OTA_CHECK_INTERVAL))
         {
-            lastOtaCheckTime = millis();
+            lastOtaCheckTime = now;
+            otaCheckedOnce = true;
             checkForUpdates();
         }
     }
 }
-
 // =================================================================
 // FUNCIONES AUXILIARES
 // =================================================================
@@ -214,12 +281,22 @@ void setupWifi()
 {
     Serial.print("Conectando a WiFi: ");
     Serial.println(WIFI_SSID);
+
+    // 1. Limpieza profunda preventiva del chip de radio
+    WiFi.disconnect(true);
+    delay(1000);
+
+    // 2. Configurar modo Estación y encender Auto-Reconexión nativa a bajo nivel
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+
+    // 3. Iniciar conexión
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     int retries = 0;
+    // ~15 segundos de espera máxima (30 intentos * 500ms)
     while (WiFi.status() != WL_CONNECTED && retries < 30)
-    { // ~15 segundos de espera
+    {
         delay(500);
         Serial.print(".");
         retries++;
@@ -234,8 +311,9 @@ void setupWifi()
     }
     else
     {
-        Serial.println("\nNo se pudo conectar al WiFi. Reiniciando en 10 segundos...");
-        delay(10000);
+        // En el primer arranque, si falla, es mejor reiniciar todo el hardware
+        Serial.println("\nFallo crítico de WiFi en el arranque. Reiniciando el nodo...");
+        delay(5000);
         ESP.restart();
     }
 }
@@ -264,10 +342,19 @@ void reconnectMqtt()
         lastMqttReconnectAttempt = millis();
         Serial.print("Intentando conexión MQTT...");
 
-        if (mqttClient.connect(NODE_ID, MQTT_USER, MQTT_PASSWORD))
+        // 1. Creamos un topic exclusivo para el estado de vida del nodo
+        char willTopic[128];
+        snprintf(willTopic, sizeof(willTopic), "clientes/%s/estado/%s", CLIENT_ID, NODE_ID);
+
+        // 2. Conectamos inyectando el LWT (QoS 1, Retain True, Mensaje "OFFLINE")
+        if (mqttClient.connect(NODE_ID, MQTT_USER, MQTT_PASSWORD, willTopic, 1, true, "OFFLINE"))
         {
             Serial.println(" ¡Conectado!");
-            currentReconnectDelay = INITIAL_RECONNECT_DELAY_MS; // Reiniciar delay al conectar
+
+            // 3. Apenas nos conectamos, pisamos el testamento publicando "ONLINE"
+            mqttClient.publish(willTopic, "ONLINE", true);
+
+            currentReconnectDelay = INITIAL_RECONNECT_DELAY_MS;
         }
         else
         {
@@ -287,77 +374,22 @@ void reconnectMqtt()
     }
 }
 
-// void readAllSensorsAndPublish()
-// {
-//     Serial.println("Leyendo sensores para publicar...");
+// =================================================================
+// Agregar para identificar sondas por ID
+// =================================================================
 
-//     // --- REFACTORIZADO: Nuevo payload alineado con el backend ---
-//     StaticJsonDocument<512> doc;
-
-//     // 1. Añadir el ID del nodo, que es la clave principal
-//     doc["node_id"] = NODE_ID;
-
-//     // 2. Añadir el timestamp en formato ISO 8601 UTC
-//     time_t now;
-//     time(&now);
-//     char timestampBuffer[32];
-//     strftime(timestampBuffer, sizeof(timestampBuffer), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
-//     doc["timestamp"] = timestampBuffer;
-
-//     // 3. Leer y añadir temperatura y humedad ambiente (DHT11)
-//     float humidity = dht.readHumidity();
-//     float temperature_dht = dht.readTemperature();
-//     if (!isnan(humidity))
-//     {
-//         doc["ambiente_hum"] = humidity;
-//     }
-//     if (!isnan(temperature_dht))
-//     {
-//         doc["ambiente_temp"] = temperature_dht;
-//     }
-
-//     // 4. Leer y añadir corrientes (SCT-013)
-//     // --- REFACTORIZADO: Reducir el número de muestras para evitar bloqueo ---
-//     // 250ms de muestreo es un buen compromiso. 1480 muestras ~ 250ms a 60Hz.
-//     double Irms1 = emon1.calcIrms(250);
-//     double Irms2 = emon2.calcIrms(250);
-//     doc["corriente_a"] = Irms1;
-//     doc["corriente_b"] = Irms2;
-
-//     // 5. Leer y añadir temperaturas de las sondas (DS18B20)
-//     ds18b20_sensors.requestTemperatures();
-//     JsonArray sondas_temp = doc.createNestedArray("sondas_temp");
-//     for (int i = 0; i < DS18B20_COUNT; i++)
-//     {
-//         float tempC = ds18b20_sensors.getTempCByIndex(i);
-//         // --- REFACTORIZADO: Añadir al array solo si la lectura es válida ---
-//         if (tempC != DEVICE_DISCONNECTED_C)
-//         {
-//             sondas_temp.add(tempC);
-//         }
-//         else
-//         {
-//             sondas_temp.add(nullptr); // Añadir 'null' para mantener el orden si una sonda falla
-//             Serial.printf("Error: No se pudo leer del sensor DS18B20 #%d\n", i);
-//         }
-//     }
-
-//     // Serializar y publicar
-//     char buffer[512];
-//     size_t n = serializeJson(doc, buffer);
-
-//     Serial.print("Publicando payload: ");
-//     Serial.println(buffer);
-
-//     if (mqttClient.publish(mqttTopicPub, buffer, n))
-//     {
-//         Serial.println("Mensaje publicado con éxito.");
-//     }
-//     else
-//     {
-//         Serial.println("Error al publicar el mensaje.");
-//     }
-// }
+String getAddressStr(DeviceAddress deviceAddress)
+{
+    String str = "";
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        if (deviceAddress[i] < 16)
+            str += "0";
+        str += String(deviceAddress[i], HEX);
+    }
+    str.toUpperCase();
+    return str;
+}
 
 void processSensors(bool publishNow)
 {
@@ -370,7 +402,7 @@ void processSensors(bool publishNow)
         Serial.println("Sin conexión. Leyendo sensores para guardar en disco...");
     }
 
-    StaticJsonDocument<512> doc;
+    StaticJsonDocument<1024> doc;
     doc["node_id"] = NODE_ID;
 
     time_t now;
@@ -392,23 +424,54 @@ void processSensors(bool publishNow)
     doc["corriente_a"] = Irms1;
     doc["corriente_b"] = Irms2;
 
-    ds18b20_sensors.requestTemperatures();
-    JsonArray sondas_temp = doc.createNestedArray("sondas_temp");
+    // =================================================================
+    // Cambiar para identificar sondas por ID
+    // =================================================================
+
+    // JsonArray sondas_temp = doc.createNestedArray("sondas_temp");
+    // for (int i = 0; i < detected_ds18b20_count; i++)
+    // {
+    //     float tempC = ds18b20_sensors.getTempCByIndex(i);
+    //     if (tempC > -127.0)
+    //     {
+    //         sondas_temp.add(tempC);
+    //     }
+    //     else
+    //     {
+    //         sondas_temp.add(nullptr);
+    //         Serial.printf("Error: No se pudo leer del sensor DS18B20 #%d\n", i);
+    //     }
+    // }
+    // Cambiamos el array simple por un array de objetos con ID y Temperatura
+    JsonArray sondas_data = doc.createNestedArray("sondas_raw");
+
     for (int i = 0; i < detected_ds18b20_count; i++)
     {
-        float tempC = ds18b20_sensors.getTempCByIndex(i);
-        if (tempC > -127.0)
+        DeviceAddress tempDeviceAddress;
+        if (ds18b20_sensors.getAddress(tempDeviceAddress, i))
         {
-            sondas_temp.add(tempC);
-        }
-        else
-        {
-            sondas_temp.add(nullptr);
-            Serial.printf("Error: No se pudo leer del sensor DS18B20 #%d\n", i);
+            float tempC = ds18b20_sensors.getTempC(tempDeviceAddress);
+
+            JsonObject s = sondas_data.createNestedObject();
+            s["address"] = getAddressStr(tempDeviceAddress); // ID Único
+
+            if (tempC > -127.0)
+            {
+                s["t"] = tempC;
+            }
+            else
+            {
+                s["t"] = nullptr;
+                Serial.printf("Error de lectura en sonda: %s\n", getAddressStr(tempDeviceAddress).c_str());
+            }
         }
     }
 
-    char buffer[512];
+    // =================================================================
+    // Hasta aquí
+    // =================================================================
+
+    char buffer[1024];
     size_t n = serializeJson(doc, buffer);
 
     if (publishNow)
@@ -431,142 +494,261 @@ void processSensors(bool publishNow)
 
 void saveReadingToDisk(const char *payload)
 {
+
+    // 1. Verificar espacio total (Opcional pero recomendado)
+    size_t totalBytes = LittleFS.totalBytes();
+    size_t usedBytes = LittleFS.usedBytes();
+    if ((usedBytes * 100 / totalBytes) > MAX_FS_USAGE_PERCENT)
+    {
+        Serial.println("LittleFS: Espacio insuficiente. Abortando guardado.");
+        return;
+    }
+
+    // 2. Contar archivos y borrar el más antiguo si excedemos el límite
+    File root = LittleFS.open("/data");
+    int fileCount = 0;
+    String oldestFile = "";
+
+    File file = root.openNextFile();
+    while (file)
+    {
+        fileCount++;
+        if (oldestFile == "")
+            oldestFile = "/data/" + String(file.name());
+        file = root.openNextFile();
+    }
+    root.close();
+
+    if (fileCount >= MAX_BUFFERED_FILES)
+    {
+        Serial.printf("Límite de archivos alcanzado (%d). Borrando el más antiguo: %s\n", fileCount, oldestFile.c_str());
+        LittleFS.remove(oldestFile);
+    }
+
+    // 3. Proceder a guardar el nuevo archivo
     char filename[32];
     sprintf(filename, "/data/%ld.json", time(nullptr));
 
-    File file = LittleFS.open(filename, "w");
-    if (!file)
+    File newFile = LittleFS.open(filename, "w");
+    if (!newFile)
     {
-        Serial.println("Error al abrir el archivo para escritura");
+        Serial.println("Error al abrir archivo para escritura");
         return;
     }
-    if (file.print(payload))
+
+    if (newFile.print(payload))
     {
-        Serial.printf("Lectura guardada en disco: %s\n", filename);
+        Serial.printf("Lectura guardada: %s\n", filename);
     }
-    else
-    {
-        Serial.println("Error al escribir en el archivo");
-    }
-    file.close();
+    newFile.close();
 }
 
 void sendBufferedReadings()
 {
+    if (!filesToSync)
+        return;
+
     File root = LittleFS.open("/data");
-    if (!root || !root.isDirectory())
+
+    File file = root.openNextFile();
+
+    if (!file)
     {
-        if (root)
-            root.close();
+        filesToSync = false; // No hay más archivos, dejar de buscar hasta el próximo fallo de envío
+        root.close();
         return;
     }
 
-    File file = root.openNextFile();
-    // Enviar solo un archivo por ciclo para no bloquear el loop por mucho tiempo
-    if (file)
+    // Si hay un archivo, procesarlo
+    String fullPath = "/data/" + String(file.name());
+    String payload = file.readString();
+    file.close();
+
+    if (mqttClient.publish(mqttTopicPub, payload.c_str(), payload.length()))
     {
-        Serial.printf("Encontrado mensaje en búfer: %s\n", file.name());
-        String payload = file.readString();
-        String fullPath = "/data/" + String(file.name());
-        file.close();
-
-        if (mqttClient.publish(mqttTopicPub, payload.c_str(), payload.length()))
-        {
-            Serial.printf("Mensaje en búfer %s enviado. Eliminando archivo.\n", fullPath.c_str());
-
-            // Ahora usamos la ruta completa para eliminar el archivo
-            if (!LittleFS.remove(fullPath.c_str()))
-            {
-                Serial.printf("Error al eliminar el archivo: %s\n", fullPath.c_str());
-            }
-        }
-        else
-        {
-            Serial.println("Fallo al enviar mensaje en búfer. Se reintentará.");
-        }
+        Serial.printf("Buffer: %s enviado con éxito.\n", fullPath.c_str());
+        LittleFS.remove(fullPath);
+    }
+    else
+    {
+        Serial.println("Buffer: Fallo al enviar, se reintentará luego.");
+        // Si falla el envío, no intentamos con el siguiente para no saturar
     }
     root.close();
 }
 
+// =================================================================
+// FUNCIÓN AUXILIAR: Comparar versiones semánticas
+// =================================================================
+bool isNewerVersion(const char *serverVer, const char *currentVer)
+{
+    int sMajor = 0, sMinor = 0, sPatch = 0;
+    int cMajor = 0, cMinor = 0, cPatch = 0;
+
+    // Parsear versión del servidor
+    sscanf(serverVer, "%d.%d.%d", &sMajor, &sMinor, &sPatch);
+    // Parsear versión actual
+    sscanf(currentVer, "%d.%d.%d", &cMajor, &cMinor, &cPatch);
+
+    // Comparar versiones
+    if (sMajor > cMajor)
+        return true;
+    if (sMajor < cMajor)
+        return false;
+
+    if (sMinor > cMinor)
+        return true;
+    if (sMinor < cMinor)
+        return false;
+
+    if (sPatch > cPatch)
+        return true;
+
+    return false;
+}
+
 void checkForUpdates()
 {
-    Serial.println("Buscando actualizaciones de firmware...");
-    HTTPClient http;
+    Serial.println("=== INICIO VERIFICACIÓN OTA ===");
+    Serial.printf("Versión actual: %s\n", FIRMWARE_VERSION);
 
+    HTTPClient http;
+    http.setTimeout(15000); // 15 segundos de timeout
+
+    // --- PASO 1: Obtener versión disponible ---
+    Serial.println("Descargando version.json...");
     http.begin(OTA_VERSION_URL);
     int httpCode = http.GET();
+
     if (httpCode != HTTP_CODE_OK)
     {
-        Serial.printf("Error al buscar versión, código: %d\n", httpCode);
-        http.end(); // Asegurar limpieza
+        Serial.printf("❌ Error al buscar versión, código HTTP: %d\n", httpCode);
+        http.end();
         return;
     }
 
-    StaticJsonDocument<128> doc;
-    DeserializationError error = deserializeJson(doc, http.getString());
-    http.end(); // Limpiar después de usar el stream/string
+    // Aumentar tamaño del buffer y procesar respuesta
+    String payload = http.getString();
+    http.end(); // Liberar INMEDIATAMENTE después de obtener el string
+
+    Serial.printf("Respuesta del servidor: %s\n", payload.c_str());
+
+    StaticJsonDocument<256> doc; // Aumentado a 256 bytes
+    DeserializationError error = deserializeJson(doc, payload);
 
     if (error)
     {
-        Serial.print(F("deserializeJson() falló: "));
+        Serial.print("❌ Error al parsear JSON: ");
         Serial.println(error.c_str());
         return;
     }
 
     const char *serverVersion = doc["version"];
-    Serial.printf("Versión actual: %s, Versión del servidor: %s\n", FIRMWARE_VERSION, serverVersion);
-
-    if (strcmp(serverVersion, FIRMWARE_VERSION) > 0)
+    if (!serverVersion)
     {
-        Serial.println("¡Nueva versión disponible! Iniciando actualización...");
-        http.begin(OTA_FIRMWARE_URL);
-        int httpCodeFw = http.GET();
-        if (httpCodeFw != HTTP_CODE_OK)
-        {
-            Serial.printf("Error al descargar firmware, código: %d\n", httpCodeFw);
-            http.end();
-            return;
-        }
+        Serial.println("❌ Campo 'version' no encontrado en el JSON");
+        return;
+    }
 
-        int contentLength = http.getSize();
-        if (contentLength <= 0)
-        {
-            Serial.println("Error: Content-Length es inválido.");
-            http.end();
-            return;
-        }
+    Serial.printf("Versión del servidor: %s\n", serverVersion);
 
-        if (!Update.begin(contentLength))
-        {
-            Update.printError(Serial);
-            http.end();
-            return;
-        }
+    // --- PASO 2: Comparar versiones correctamente ---
+    if (!isNewerVersion(serverVersion, FIRMWARE_VERSION))
+    {
+        Serial.println("✅ El firmware ya está actualizado.");
+        return;
+    }
 
-        // Realizar la actualización
-        size_t written = Update.writeStream(*http.getStreamPtr());
+    Serial.println("🔄 ¡Nueva versión disponible! Iniciando actualización...");
 
-        if (written != contentLength)
-        {
-            Serial.printf("Error de escritura: %d de %d bytes.\n", written, contentLength);
-        }
+    // --- PASO 3: Descargar firmware ---
+    http.begin(OTA_FIRMWARE_URL);
+    httpCode = http.GET();
 
-        http.end(); // Limpiar la conexión HTTP tan pronto como sea posible
+    if (httpCode != HTTP_CODE_OK)
+    {
+        Serial.printf("❌ Error al descargar firmware, código HTTP: %d\n", httpCode);
+        http.end();
+        return;
+    }
 
-        if (Update.end(true)) // true para aplicar la actualización
+    int contentLength = http.getSize();
+    Serial.printf("Tamaño del firmware: %d bytes\n", contentLength);
+
+    if (contentLength <= 0 || contentLength > 2000000)
+    { // Límite de 2MB por seguridad
+        Serial.println("❌ Content-Length inválido.");
+        http.end();
+        return;
+    }
+
+    // --- PASO 4: Iniciar actualización OTA ---
+    if (!Update.begin(contentLength))
+    {
+        Serial.println("❌ Error al iniciar Update:");
+        Update.printError(Serial);
+        http.end();
+        return;
+    }
+
+    Serial.println("Descargando firmware...");
+
+    // --- PASO 5: Escribir firmware con feedback ---
+    WiFiClient *stream = http.getStreamPtr();
+    size_t written = 0;
+    uint8_t buff[512];
+    int lastPercent = 0;
+
+    while (http.connected() && (written < contentLength))
+    {
+        size_t available = stream->available();
+
+        if (available)
         {
-            Serial.println("¡Actualización OTA completada! Reiniciando...");
-            ESP.restart();
+            int c = stream->readBytes(buff, min(available, sizeof(buff)));
+
+            if (c > 0)
+            {
+                Update.write(buff, c);
+                written += c;
+
+                // Mostrar progreso cada 10%
+                int percent = (written * 100) / contentLength;
+                if (percent >= lastPercent + 10)
+                {
+                    Serial.printf("Progreso: %d%% (%d/%d bytes)\n", percent, written, contentLength);
+                    lastPercent = percent;
+                    esp_task_wdt_reset(); // Alimentar watchdog durante descarga larga
+                }
+            }
         }
-        else
-        {
-            Serial.println("Error en Update.end(). La actualización falló.");
-            Update.printError(Serial);
-        }
+        delay(1);
+        esp_task_wdt_reset(); // Alimentar watchdog
+    }
+
+    http.end(); // Liberar conexión HTTP
+
+    if (written != contentLength)
+    {
+        Serial.printf("❌ Error: Solo se escribieron %d de %d bytes\n", written, contentLength);
+        Update.abort();
+        return;
+    }
+
+    // --- PASO 6: Finalizar actualización ---
+    if (Update.end(true))
+    {
+        Serial.println("✅ ¡Actualización OTA completada exitosamente!");
+        Serial.printf("Nueva versión: %s\n", serverVersion);
+        Serial.println("Reiniciando en 3 segundos...");
+        delay(3000);
+        ESP.restart();
     }
     else
     {
-        Serial.println("El firmware ya está actualizado.");
+        Serial.println("❌ Error al finalizar Update:");
+        Update.printError(Serial);
+        Update.abort();
     }
 }
 
